@@ -1,0 +1,51 @@
+name: Coletar apuração
+
+# Busca o TSE a cada 30s e grava os resultados no branch `dados`.
+# No dia 25/10 começa sozinho às 16h45 (Brasília). O agendamento do GitHub pode
+# atrasar alguns minutos: por garantia, dispare também à mão em Actions → Run workflow.
+on:
+  schedule:
+    - cron: "45 19 25 10 *" # 19h45 UTC = 16h45 de Brasília, 25/10
+  workflow_dispatch:
+    inputs:
+      eleicao:
+        description: "Eleição (6258 = 2º turno, 6257 = 1º turno)"
+        type: choice
+        options: ["6258", "6257"]
+        default: "6258"
+      duracao:
+        description: "Minutos coletando (0 = uma vez só)"
+        default: "330"
+
+permissions:
+  contents: write
+
+# Um coletor por vez: dois ao mesmo tempo sobrescreveriam o branch `dados`
+concurrency:
+  group: coletor
+  cancel-in-progress: false
+
+jobs:
+  coletar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          ref: dados
+          path: saida
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Configurar git
+        run: |
+          git -C saida config user.name "coletor-apuracao"
+          git -C saida config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Coletar
+        run: >
+          node coletor/coletar.ts
+          --eleicao "${{ inputs.eleicao || '6258' }}"
+          --duracao "${{ inputs.duracao || '330' }}"
+          --intervalo 30
+          --saida saida

@@ -1,11 +1,16 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Candidato, CodigoEleicao, RespostaApuracao, ResultadoAbrangencia } from "@/lib/tse";
+import { simular, type Apuracao, type Candidato, type CodigoEleicao, type Ponto, type ResultadoAbrangencia } from "@/lib/tse";
 
-const INTERVALO_S = 15;
+// Os dados vêm do branch `dados` deste repositório, gravados pelo coletor (GitHub Actions)
+const REPO = "boobaxrm2-cloud/apuracao-2026";
+const RAW = `https://raw.githubusercontent.com/${REPO}`;
+// A API do GitHub sem login permite 60 consultas/hora por IP: 1 por minuto
+const INTERVALO_S = 60;
 const ELEICAO_2T: CodigoEleicao = "6258";
 const ELEICAO_DEMO: CodigoEleicao = "6257";
+const SIM_PERMITIDA = process.env.NODE_ENV === "development";
 // Início da divulgação dos resultados: 25/10/2026, 17h de Brasília
 const INICIO_APURACAO = new Date("2026-10-25T17:00:00-03:00");
 
@@ -34,59 +39,72 @@ const fmtPct = new Intl.NumberFormat("pt-BR", { minimumFractionDigits: 2, maximu
 const pct = (v: number) => `${fmtPct.format(v)}%`;
 
 type Modo = CodigoEleicao | "sim";
-type Ponto = { a: number; h: string; v: Record<string, number> };
+type Resposta = { status: "aguardando" } | ({ status: "ok" } & Apuracao);
 
 function lerEleicaoDaUrl(): Modo {
   try {
     const p = new URLSearchParams(window.location.search).get("ele");
-    if (p === ELEICAO_DEMO || p === ELEICAO_2T || p === "sim") return p;
+    if (p === ELEICAO_DEMO || p === ELEICAO_2T) return p;
+    if (p === "sim" && SIM_PERMITIDA) return p;
   } catch {}
   return ELEICAO_2T;
 }
 
-function lerHistorico(ele: string): Ponto[] {
+// SHA do último commit do branch `dados`. Um arquivo lido pelo SHA nunca vem
+// velho do cache do raw.githubusercontent.com (que ignora query string e guarda por 5 min).
+async function refDosDados(): Promise<string> {
   try {
-    return JSON.parse(localStorage.getItem(`historico-${ele}`) ?? "[]");
-  } catch {
-    return [];
-  }
-}
-
-function salvarHistorico(ele: string, h: Ponto[]) {
-  try {
-    localStorage.setItem(`historico-${ele}`, JSON.stringify(h.slice(-500)));
+    const r = await fetch(`https://api.github.com/repos/${REPO}/commits/dados`, {
+      cache: "no-store",
+      headers: { Accept: "application/vnd.github.sha" },
+    });
+    if (r.ok) return (await r.text()).trim();
   } catch {}
+  return "dados"; // limite da API estourado: lê pelo branch (pode atrasar até 5 min)
 }
 
 export default function Painel() {
   const [ele, setEle] = useState<Modo | null>(null);
-  const [dados, setDados] = useState<RespostaApuracao | null>(null);
+  const [dados, setDados] = useState<Resposta | null>(null);
   const [erro, setErro] = useState<string | null>(null);
   const [proxima, setProxima] = useState(INTERVALO_S);
   const [historico, setHistorico] = useState<Ponto[]>([]);
+  const ultimaRef = useRef("");
+  const sim = useRef<{ base: Apuracao | null; progresso: number }>({ base: null, progresso: 0 });
 
   useEffect(() => setEle(lerEleicaoDaUrl()), []);
 
   const atualizar = useCallback(async () => {
     if (!ele) return;
     try {
-      const res = await fetch(`/api/resultados?ele=${ele}`, { cache: "no-store" });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.erro ?? "Falha ao consultar");
-      setDados(json);
-      setErro(null);
-      if (json.status === "ok") {
-        const br: ResultadoAbrangencia = json.brasil;
-        setHistorico((ant) => {
-          const ultimo = ant[ant.length - 1];
-          if (ultimo && ultimo.a === br.pctApurado) return ant;
-          const v: Record<string, number> = {};
-          br.candidatos.slice(0, 2).forEach((c) => (v[c.numero] = c.pct));
-          const novo = [...ant, { a: br.pctApurado, h: br.atualizadoEm, v }];
-          salvarHistorico(ele, novo);
-          return novo;
-        });
+      if (ele === "sim") {
+        if (!sim.current.base) {
+          const r = await fetch(`${RAW}/dados/${ELEICAO_2T}.json`, { cache: "no-store" });
+          sim.current.base = await r.json();
+        }
+        sim.current.progresso = Math.min(100, sim.current.progresso + 4);
+        const ap = simular(sim.current.base!, sim.current.progresso);
+        setDados({ status: "ok", ...ap });
+        const v: Record<string, number> = {};
+        ap.brasil.candidatos.forEach((c) => (v[c.numero] = c.pct));
+        setHistorico((h) => [...h, { a: ap.brasil.pctApurado, h: ap.brasil.atualizadoEm, v }]);
+      } else {
+        const ref = await refDosDados();
+        if (ref !== "dados" && ref === ultimaRef.current) return; // nada novo
+        const [ra, rh] = await Promise.all([
+          fetch(`${RAW}/${ref}/${ele}.json`, { cache: "no-store" }),
+          fetch(`${RAW}/${ref}/${ele}-historico.json`, { cache: "no-store" }),
+        ]);
+        if (ra.status === 404) {
+          setDados({ status: "aguardando" });
+        } else {
+          if (!ra.ok) throw new Error("Falha ao ler os dados");
+          setDados({ status: "ok", ...(await ra.json()) });
+          setHistorico(rh.ok ? await rh.json() : []);
+        }
+        ultimaRef.current = ref;
       }
+      setErro(null);
     } catch (e) {
       setErro(e instanceof Error ? e.message : "Falha ao consultar");
     } finally {
@@ -97,7 +115,9 @@ export default function Painel() {
   useEffect(() => {
     if (!ele) return;
     setDados(null);
-    setHistorico(ele === "sim" ? [] : lerHistorico(ele));
+    setHistorico([]);
+    ultimaRef.current = "";
+    sim.current = { base: null, progresso: 0 };
     atualizar();
     const timer = setInterval(() => {
       setProxima((s) => {
@@ -108,12 +128,7 @@ export default function Painel() {
         return s - 1;
       });
     }, 1000);
-    const aoVoltar = () => document.visibilityState === "visible" && atualizar();
-    document.addEventListener("visibilitychange", aoVoltar);
-    return () => {
-      clearInterval(timer);
-      document.removeEventListener("visibilitychange", aoVoltar);
-    };
+    return () => clearInterval(timer);
   }, [ele, atualizar]);
 
   const trocarEleicao = (novo: Modo) => {
@@ -186,7 +201,7 @@ export default function Painel() {
   );
 }
 
-function Status({ dados, erro, proxima }: { dados: RespostaApuracao | null; erro: string | null; proxima: number }) {
+function Status({ dados, erro, proxima }: { dados: Resposta | null; erro: string | null; proxima: number }) {
   let rotulo = "Conectando";
   let tipo = "neutro";
   if (erro) { rotulo = "Sem conexão"; tipo = "erro"; }
@@ -200,7 +215,7 @@ function Status({ dados, erro, proxima }: { dados: RespostaApuracao | null; erro
     <div className="status">
       <span className={`pilula pilula-${tipo}`}><span className="ponto" aria-hidden />{rotulo}</span>
       <span className="status-info">
-        {dados?.status === "ok" && <>TSE: {dados.brasil.atualizadoEm.slice(11)} · </>}
+        {dados?.status === "ok" && <>TSE: {dados.brasil.atualizadoEm.slice(11)} · coletado {new Date(dados.consultadoEm).toLocaleTimeString("pt-BR")} · </>}
         próxima consulta em {proxima}s
       </span>
     </div>
@@ -513,8 +528,7 @@ function Evolucao({ historico, candidatos, cores }: {
       <div className="grafico" ref={caixa}>
         {pontos.length < 2 ? (
           <p className="mudo vazio">
-            O gráfico é montado a cada atualização enquanto esta página fica aberta. Volte durante a
-            apuração para acompanhar a evolução.
+            O gráfico aparece a partir da segunda atualização da apuração.
           </p>
         ) : (
           <>

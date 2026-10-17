@@ -2,6 +2,7 @@
 // Formato descoberto em resultados.tse.jus.br/oficial/comum/config/ele-c.json:
 //   <base>/oficial/ele2026/<cd_eleicao>/dados/<uf>/<uf>-c0001-e<cd_eleicao 6 dígitos>-u.json
 // c0001 = cargo Presidente.
+// Usado pelo coletor (Node, GitHub Actions) e, só para tipos/simulação, pelo site.
 
 const BASE = "https://resultados.tse.jus.br/oficial/ele2026";
 
@@ -48,15 +49,15 @@ export type ResultadoAbrangencia = {
   candidatos: Candidato[];
 };
 
-export type RespostaApuracao =
-  | { status: "aguardando"; eleicao: CodigoEleicao; consultadoEm: string }
-  | {
-      status: "ok";
-      eleicao: CodigoEleicao;
-      consultadoEm: string;
-      brasil: ResultadoAbrangencia;
-      estados: ResultadoAbrangencia[];
-    };
+export type Apuracao = {
+  eleicao: CodigoEleicao;
+  consultadoEm: string; // ISO, quando o coletor leu o TSE
+  brasil: ResultadoAbrangencia;
+  estados: ResultadoAbrangencia[];
+};
+
+// Um ponto do gráfico de evolução: % apurado → % de cada finalista
+export type Ponto = { a: number; h: string; v: Record<string, number> };
 
 const num = (v: unknown) => Number(String(v ?? "0").replace(",", ".")) || 0;
 const int = (v: unknown) => parseInt(String(v ?? "0"), 10) || 0;
@@ -123,38 +124,25 @@ async function buscar(ele: CodigoEleicao, uf: string) {
   return normalizar(ele, await res.json());
 }
 
-// Cache em memória: mesmo com muitos visitantes, o TSE recebe no máximo
-// uma rodada de requisições a cada TTL por instância do servidor.
-const TTL_MS = 15_000;
-const cache = new Map<string, { em: number; dados: Promise<RespostaApuracao> }>();
-
-async function carregar(ele: CodigoEleicao): Promise<RespostaApuracao> {
-  const consultadoEm = new Date().toISOString();
+// null = TSE ainda não publicou o arquivo nacional
+export async function carregarApuracao(ele: CodigoEleicao): Promise<Apuracao | null> {
   const brasil = await buscar(ele, "br");
-  if (!brasil) return { status: "aguardando", eleicao: ele, consultadoEm };
-
+  if (!brasil) return null;
   const estados = (
     await Promise.all(UFS.map((uf) => buscar(ele, uf).catch(() => null)))
   ).filter((r): r is ResultadoAbrangencia => r !== null);
-
-  return { status: "ok", eleicao: ele, consultadoEm, brasil, estados };
+  return { eleicao: ele, consultadoEm: new Date().toISOString(), brasil, estados };
 }
 
-export function obterApuracao(ele: CodigoEleicao): Promise<RespostaApuracao> {
-  const hit = cache.get(ele);
-  if (hit && Date.now() - hit.em < TTL_MS) return hit.dados;
-  const dados = carregar(ele);
-  cache.set(ele, { em: Date.now(), dados });
-  // Se falhar, não deixa o erro preso no cache
-  dados.catch(() => cache.delete(ele));
-  return dados;
+export function pontoDe(br: ResultadoAbrangencia): Ponto {
+  const v: Record<string, number> = {};
+  br.candidatos.slice(0, 2).forEach((c) => (v[c.numero] = c.pct));
+  return { a: br.pctApurado, h: br.atualizadoEm, v };
 }
 
 // ---------------------------------------------------------------------------
-// Simulação (só para testes; habilitada com PERMITIR_SIMULACAO=1).
-// Usa o arquivo real do 2º turno (zerado) e avança 4% a cada consulta
-// (com a página aberta, 100% em ~6 minutos).
-let consultasSimulacao = 0;
+// Simulação (só no `npm run dev`, com /?ele=sim): parte do arquivo real do
+// 2º turno (zerado) e "apura" um pouco a cada consulta.
 
 function semente(uf: string) {
   let h = 0;
@@ -196,11 +184,16 @@ function simularAbrangencia(r: ResultadoAbrangencia, progresso: number): Resulta
   };
 }
 
-export async function obterSimulacao(): Promise<RespostaApuracao> {
-  const base = await obterApuracao("6258");
-  if (base.status !== "ok") return base;
-  const progresso = Math.min(100, ++consultasSimulacao * 4);
+export function simular(base: Apuracao, progresso: number): Apuracao {
+  // O nacional é a soma dos estados, para o mapa e o placar baterem
   const estados = base.estados.map((e) => simularAbrangencia(e, progresso));
   const brasil = simularAbrangencia(base.brasil, progresso);
-  return { ...base, brasil, estados };
+  const somaPor = (n: string) =>
+    estados.reduce((t, e) => t + (e.candidatos.find((c) => c.numero === n)?.votos ?? 0), 0);
+  const validos = brasil.candidatos.reduce((t, c) => t + somaPor(c.numero), 0);
+  brasil.candidatos = brasil.candidatos
+    .map((c) => ({ ...c, votos: somaPor(c.numero), pct: validos ? (somaPor(c.numero) / validos) * 100 : 0 }))
+    .sort((a, b) => b.votos - a.votos);
+  brasil.validos = validos;
+  return { ...base, consultadoEm: new Date().toISOString(), brasil, estados };
 }
