@@ -215,7 +215,7 @@ function Status({ dados, erro, proxima }: { dados: Resposta | null; erro: string
     <div className="status">
       <span className={`pilula pilula-${tipo}`}><span className="ponto" aria-hidden />{rotulo}</span>
       <span className="status-info">
-        {dados?.status === "ok" && <>TSE: {dados.brasil.atualizadoEm.slice(11)} · coletado {new Date(dados.consultadoEm).toLocaleTimeString("pt-BR")} · </>}
+        {dados?.status === "ok" && <>TSE: {dados.brasil.atualizadoEm.slice(11)} · coletado {new Date(dados.consultadoEm).toLocaleTimeString("pt-BR", { timeZone: "America/Sao_Paulo" })} · </>}
         próxima consulta em {proxima}s
       </span>
     </div>
